@@ -65,15 +65,61 @@ func TestParseEmbeddedToolCallsWithInputVariant(t *testing.T) {
 	}
 }
 
+func TestSanitizeToolNarrationContentCursorParamsFormat(t *testing.T) {
+	text := `Để phân tích dự án, tôi sẽ xem qua cấu trúc thư mục trước.
+<tool_call> {"name": "terminal", "params": {"command": "find /home/genson1808/poo -type f | head -50"}} </tool_call>
+<tool_response> /home/genson1808/poo/Shape.java </tool_response>`
+
+	cleaned, uses := SanitizeToolNarrationContent(text, nil)
+	if len(uses) != 1 {
+		t.Fatalf("expected 1 tool use, got %d: %+v", len(uses), uses)
+	}
+	if uses[0].Name != "terminal" {
+		t.Fatalf("expected terminal, got %q", uses[0].Name)
+	}
+	if uses[0].Input["command"] == nil {
+		t.Fatalf("expected command param, got %#v", uses[0].Input)
+	}
+	if strings.Contains(cleaned, "<tool_call>") || strings.Contains(cleaned, "<tool_response>") {
+		t.Fatalf("expected markup stripped, got %q", cleaned)
+	}
+	if !strings.Contains(cleaned, "Để phân tích dự án") {
+		t.Fatalf("expected prose preserved, got %q", cleaned)
+	}
+}
+
+func TestParseXMLStyleToolCallsParamsAlias(t *testing.T) {
+	text := `<tool_call> {"name": "terminal", "params": {"command": "ls -la"}} </tool_call>`
+	cleaned, uses := ParseXMLStyleToolCalls(text, nil)
+	if len(uses) != 1 {
+		t.Fatalf("expected 1 tool use, got %d", len(uses))
+	}
+	if uses[0].Name != "terminal" {
+		t.Fatalf("expected terminal, got %q", uses[0].Name)
+	}
+	if uses[0].Input["command"] != "ls -la" {
+		t.Fatalf("unexpected input: %#v", uses[0].Input)
+	}
+	if strings.Contains(cleaned, "<tool_call>") {
+		t.Fatalf("expected markup stripped, got %q", cleaned)
+	}
+}
+
 func TestToolNarrationStreamFilterHoldsPartialTag(t *testing.T) {
 	var f ToolNarrationStreamFilter
-	out := f.Process("hello <tool_call> {\"name\":\"x\"")
+	out, tools := f.Process("hello <tool_call> {\"name\":\"x\"")
 	if out != "hello " {
 		t.Fatalf("expected safe prefix only, got %q", out)
 	}
-	out = f.Process(`,"arguments":{}} </tool_call>`)
+	if len(tools) != 0 {
+		t.Fatalf("expected no tools yet, got %d", len(tools))
+	}
+	out, tools = f.Process(`,"arguments":{}} </tool_call>`)
 	if strings.Contains(out, "<tool_call>") {
 		t.Fatalf("expected completed block suppressed, got %q", out)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 extracted tool, got %d", len(tools))
 	}
 }
 

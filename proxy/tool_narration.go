@@ -2,17 +2,20 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 const (
-	toolCallStartTag      = "<tool_call>"
-	toolCallEndTag        = "</tool_call>"
-	toolResponseStartTag  = "<tool_response>"
-	toolResponseEndTag    = "</tool_response>"
+	toolCallStartTag     = "<tool_call>"
+	toolCallEndTag       = "</tool_call>"
+	toolResponseStartTag = "<tool_response>"
+	toolResponseEndTag   = "</tool_response>"
 )
 
 var (
@@ -26,28 +29,76 @@ var (
 // ToolNarrationStreamFilter suppresses tool narration markup from streamed assistant
 // text while holding back partial tag prefixes at chunk boundaries.
 type ToolNarrationStreamFilter struct {
-	pending strings.Builder
+	pending           strings.Builder
+	emitted           int
+	processedToolKeys map[string]bool
 }
 
-func (f *ToolNarrationStreamFilter) Process(chunk string) string {
-	if chunk == "" {
-		return ""
+func (f *ToolNarrationStreamFilter) initMaps() {
+	if f.processedToolKeys == nil {
+		f.processedToolKeys = map[string]bool{}
 	}
+}
+
+// Process returns newly safe assistant text (delta only) and any tool calls
+// completed in this chunk. Cursor/Kiro often embed <tool_call> blocks in text
+// using {"name","params"} instead of OpenAI tool_calls events.
+func (f *ToolNarrationStreamFilter) Process(chunk string) (safeDelta string, newTools []KiroToolUse) {
+	if chunk == "" {
+		return "", nil
+	}
+	f.initMaps()
+
 	f.pending.WriteString(chunk)
-	cleaned := stripCompleteToolNarrationBlocks(f.pending.String())
+	full := f.pending.String()
+	cleaned, newTools := SanitizeToolNarrationContent(full, f.processedToolKeys)
+
 	safe, hold := holdIncompleteToolNarrationSuffix(cleaned)
+	if len(safe) > f.emitted {
+		safeDelta = safe[f.emitted:]
+		f.emitted = len(safe)
+	} else if len(safe) < f.emitted {
+		f.emitted = len(safe)
+	}
+
 	f.pending.Reset()
 	f.pending.WriteString(hold)
-	return safe
+	return safeDelta, newTools
+}
+
+func dropTrailingIncompleteToolNarration(text string) string {
+	safe, hold := holdIncompleteToolNarrationSuffix(text)
+	if hold != "" {
+		return strings.TrimSpace(safe)
+	}
+	return text
 }
 
 func (f *ToolNarrationStreamFilter) Flush() string {
 	if f.pending.Len() == 0 {
 		return ""
 	}
-	out := stripCompleteToolNarrationBlocks(f.pending.String())
+	f.initMaps()
+
+	full := f.pending.String()
+	cleaned, _ := SanitizeToolNarrationContent(full, f.processedToolKeys)
+	cleaned = dropTrailingIncompleteToolNarration(cleaned)
+	safe, _ := holdIncompleteToolNarrationSuffix(cleaned)
+
+	var delta string
+	if len(safe) > f.emitted {
+		delta = safe[f.emitted:]
+	}
 	f.pending.Reset()
-	return strings.TrimSpace(out)
+	f.emitted = 0
+	return strings.TrimSpace(delta)
+}
+
+func sanitizeStreamContentDelta(content string) string {
+	if content == "" {
+		return ""
+	}
+	return strings.TrimSpace(stripCompleteToolNarrationBlocks(content))
 }
 
 func stripCompleteToolNarrationBlocks(text string) string {
@@ -170,8 +221,7 @@ func ParseXMLStyleToolCalls(text string, processedIDs map[string]bool) (string, 
 		endTag := toolCallEndPattern.FindString(rest[end[0]:])
 		matchEnd := start[0] + end[0] + len(endTag)
 		startTag := toolCallStartPattern.FindString(rest)
-		inner := rest[len(startTag) : end[0]]
-		inner = strings.TrimSpace(inner)
+		inner := strings.TrimSpace(rest[len(startTag) : end[0]])
 
 		tu, ok := parseXMLToolCallPayload(inner)
 		if ok {
@@ -204,7 +254,7 @@ func parseXMLToolCallPayload(inner string) (KiroToolUse, bool) {
 		return KiroToolUse{}, false
 	}
 
-	input := normalizeToolCallArguments(payload["arguments"])
+	input := firstToolCallArguments(payload)
 	if input == nil {
 		input = map[string]interface{}{}
 	}
@@ -216,18 +266,30 @@ func parseXMLToolCallPayload(inner string) (KiroToolUse, bool) {
 	}, true
 }
 
+func firstToolCallArguments(payload map[string]interface{}) map[string]interface{} {
+	for _, key := range []string{"arguments", "params", "input", "parameters"} {
+		if args := normalizeToolCallArguments(payload[key]); len(args) > 0 {
+			return args
+		}
+	}
+	return normalizeToolCallArguments(payload["arguments"])
+}
+
 func normalizeToolCallArguments(raw interface{}) map[string]interface{} {
 	switch v := raw.(type) {
 	case map[string]interface{}:
+		if len(v) == 0 {
+			return nil
+		}
 		return v
 	case string:
 		repaired := RepairJSON(strings.TrimSpace(v))
 		var parsed map[string]interface{}
-		if err := json.Unmarshal([]byte(repaired), &parsed); err == nil && parsed != nil {
+		if err := json.Unmarshal([]byte(repaired), &parsed); err == nil && len(parsed) > 0 {
 			return parsed
 		}
 	}
-	return map[string]interface{}{}
+	return nil
 }
 
 // SanitizeToolNarrationContent strips fake tool narration and extracts real tool calls.
@@ -271,4 +333,66 @@ func mustJSONString(v map[string]interface{}) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// emitEmbeddedOpenAIToolCalls sends tool_calls SSE chunks for tools parsed from text.
+func emitEmbeddedOpenAIToolCalls(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	chatID, model string,
+	responseStarted *bool,
+	toolCallIndex *int,
+	toolIndexByID map[string]int,
+	openAIToolStarted map[string]bool,
+	toolCalls *[]ToolCall,
+	tools []KiroToolUse,
+) {
+	for _, tu := range tools {
+		args := MarshalToolUseArguments(tu)
+		tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
+		tc.Function.Name = tu.Name
+		tc.Function.Arguments = args
+		*toolCalls = append(*toolCalls, tc)
+
+		if openAIToolStarted[tu.ToolUseID] {
+			continue
+		}
+		openAIToolStarted[tu.ToolUseID] = true
+		idx := *toolCallIndex
+		*toolCallIndex++
+		toolIndexByID[tu.ToolUseID] = idx
+
+		startDelta := map[string]interface{}{"tool_calls": []map[string]interface{}{{
+			"index": idx, "id": tu.ToolUseID, "type": "function",
+			"function": map[string]string{"name": tu.Name, "arguments": ""},
+		}}}
+		if !*responseStarted {
+			startDelta["role"] = "assistant"
+		}
+		chunk := map[string]interface{}{
+			"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []map[string]interface{}{{"index": 0, "delta": startDelta, "finish_reason": nil}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		flusher.Flush()
+		*responseStarted = true
+
+		argChunk := map[string]interface{}{
+			"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []map[string]interface{}{{
+				"index": 0,
+				"delta": map[string]interface{}{
+					"tool_calls": []map[string]interface{}{{
+						"index":    idx,
+						"function": map[string]string{"arguments": args},
+					}},
+				},
+				"finish_reason": nil,
+			}},
+		}
+		data, _ = json.Marshal(argChunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		flusher.Flush()
+	}
 }

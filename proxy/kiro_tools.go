@@ -353,6 +353,7 @@ func mergeEmbeddedToolUses(content string, existing []KiroToolUse) (string, []Ki
 		}
 	}
 	cleaned, embedded := SanitizeToolNarrationContent(content, processed)
+	cleaned = dropTrailingIncompleteToolNarration(cleaned)
 	if len(embedded) == 0 {
 		return cleaned, existing
 	}

@@ -1199,7 +1199,43 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					rawThinkingBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
-					text = toolNarrationFilter.Process(text)
+					var embedded []KiroToolUse
+					text, embedded = toolNarrationFilter.Process(text)
+					for _, tu := range embedded {
+						if streamedToolUseIDs[tu.ToolUseID] {
+							continue
+						}
+						streamedToolUseIDs[tu.ToolUseID] = true
+						toolUses = append(toolUses, tu)
+						processClaudeText("", false, true)
+						ensureMessageStart()
+						closeActiveBlock()
+						idx := nextContentIndex
+						nextContentIndex++
+						inputJSON := MarshalToolUseArguments(tu)
+						h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+							"type":  "content_block_start",
+							"index": idx,
+							"content_block": map[string]interface{}{
+								"type":  "tool_use",
+								"id":    tu.ToolUseID,
+								"name":  tu.Name,
+								"input": map[string]interface{}{},
+							},
+						})
+						h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": idx,
+							"delta": map[string]interface{}{
+								"type":         "input_json_delta",
+								"partial_json": inputJSON,
+							},
+						})
+						h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+							"type":  "content_block_stop",
+							"index": idx,
+						})
+					}
 				}
 				processClaudeText(text, isThinking, false)
 			},
@@ -1873,6 +1909,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				if content == "" {
 					return
 				}
+				content = sanitizeStreamContentDelta(content)
+				if content == "" {
+					return
+				}
 				chunk = map[string]interface{}{
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
@@ -2006,7 +2046,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					rawReasoningBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
-					text = toolNarrationFilter.Process(text)
+					var embedded []KiroToolUse
+					text, embedded = toolNarrationFilter.Process(text)
+					emitEmbeddedOpenAIToolCalls(w, flusher, chatID, model, &responseStarted,
+						&toolCallIndex, toolIndexByID, openAIToolStarted, &toolCalls, embedded)
 				}
 				processText(text, isThinking, false)
 			},

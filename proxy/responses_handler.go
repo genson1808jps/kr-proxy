@@ -449,7 +449,39 @@ func (h *Handler) handleResponsesStream(
 					return
 				}
 				fullText.WriteString(text)
-				filtered := toolNarrationFilter.Process(text)
+				filtered, embedded := toolNarrationFilter.Process(text)
+				for _, tu := range embedded {
+					toolUses = append(toolUses, tu)
+					if toolStreamStarted[tu.ToolUseID] {
+						continue
+					}
+					finalizeMessageIfStarted()
+					fcID := generateOutputItemID("fc")
+					idx := outputIndex
+					args := MarshalToolUseArguments(tu)
+					toolStreamStarted[tu.ToolUseID] = true
+					send("response.output_item.added", map[string]interface{}{
+						"type":         "response.output_item.added",
+						"output_index": idx,
+						"item": map[string]interface{}{
+							"id":        fcID,
+							"type":      "function_call",
+							"status":    "in_progress",
+							"call_id":   tu.ToolUseID,
+							"name":      tu.Name,
+							"arguments": "",
+						},
+					})
+					send("response.function_call_arguments.delta", map[string]interface{}{
+						"type":         "response.function_call_arguments.delta",
+						"item_id":      fcID,
+						"output_index": idx,
+						"delta":        args,
+					})
+					emitFunctionCallDone(tu, fcID, idx, args)
+					outputIndex++
+					responseStarted = true
+				}
 				if filtered == "" {
 					return
 				}

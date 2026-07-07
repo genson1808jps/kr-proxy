@@ -6,6 +6,8 @@ import (
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,10 +28,18 @@ func TestThinkingSourceReasoningFirst(t *testing.T) {
 }
 
 func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) {
-	cfgFile := t.TempDir() + "/config.json"
+	dir, err := os.MkdirTemp("", "kirogo-handler-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	cfgFile := filepath.Join(dir, "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	t.Cleanup(func() {
+		clearStoredResponsesDir()
+		_ = os.RemoveAll(dir)
+	})
 
 	if err := config.AddAccount(config.Account{
 		ID:          "first",

@@ -371,6 +371,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if id, ok := responseIDFromPath(path); ok {
+		ar := h.authenticateForOpenAI(w, r)
+		if ar == nil {
+			return
+		}
+		h.handleGetResponse(w, r, id)
+		return
+	}
+
 	// 路由
 	switch {
 	// API 端点（需要验证 API Key）
@@ -849,7 +858,8 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking, agentic, chatOnly := ParseModelThinkingAndAgentic(req.Model, thinkingCfg.Suffix)
+	thinking = enrichClaudeThinking(thinking, r.Header, body, req.Thinking)
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
@@ -857,7 +867,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
+	kiroPayload := ClaudeToKiro(&req, thinking, agentic, chatOnly)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -930,8 +940,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var realInputTokens int
 		var toolUses []KiroToolUse
 		var nextContentIndex int
+		var activeToolBlockIdx = -1
+		var activeToolStreaming bool
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
+		var toolNarrationFilter ToolNarrationStreamFilter
+		streamedToolUseIDs := make(map[string]bool)
 		activeBlockIndex := -1
 		activeBlockType := ""
 
@@ -1185,22 +1199,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					rawThinkingBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
+					text = toolNarrationFilter.Process(text)
 				}
 				processClaudeText(text, isThinking, false)
 			},
-			OnToolUse: func(tu KiroToolUse) {
+			OnToolUseStart: func(tu KiroToolUse) {
+				streamedToolUseIDs[tu.ToolUseID] = true
 				processClaudeText("", false, true)
-				rawContentBuilder.WriteString(tu.Name)
-				if b, err := json.Marshal(tu.Input); err == nil {
-					rawContentBuilder.Write(b)
-				}
-
-				toolUses = append(toolUses, tu)
 				ensureMessageStart()
 				closeActiveBlock()
 
 				idx := nextContentIndex
 				nextContentIndex++
+				activeToolBlockIdx = idx
+				activeToolStreaming = true
 
 				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
@@ -1212,21 +1224,66 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						"input": map[string]interface{}{},
 					},
 				})
-
-				inputJSON, _ := json.Marshal(tu.Input)
+			},
+			OnToolUseInputDelta: func(_ string, partialJSON string) {
+				if partialJSON == "" || activeToolBlockIdx < 0 {
+					return
+				}
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
-					"index": idx,
+					"index": activeToolBlockIdx,
 					"delta": map[string]interface{}{
 						"type":         "input_json_delta",
-						"partial_json": string(inputJSON),
+						"partial_json": partialJSON,
 					},
 				})
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				streamedToolUseIDs[tu.ToolUseID] = true
+				processClaudeText("", false, true)
+				rawContentBuilder.WriteString(tu.Name)
+				if b, err := json.Marshal(ToolUseInputForClient(tu)); err == nil {
+					rawContentBuilder.Write(b)
+				}
+
+				toolUses = append(toolUses, tu)
+				if !activeToolStreaming {
+					ensureMessageStart()
+					closeActiveBlock()
+					idx := nextContentIndex
+					nextContentIndex++
+					h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+						"type":  "content_block_start",
+						"index": idx,
+						"content_block": map[string]interface{}{
+							"type":  "tool_use",
+							"id":    tu.ToolUseID,
+							"name":  tu.Name,
+							"input": map[string]interface{}{},
+						},
+					})
+					inputJSON := MarshalToolUseArguments(tu)
+					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": idx,
+						"delta": map[string]interface{}{
+							"type":         "input_json_delta",
+							"partial_json": string(inputJSON),
+						},
+					})
+					h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": idx,
+					})
+					return
+				}
 
 				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 					"type":  "content_block_stop",
-					"index": idx,
+					"index": activeToolBlockIdx,
 				})
+				activeToolStreaming = false
+				activeToolBlockIdx = -1
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -1261,6 +1318,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		processClaudeText("", false, true)
+		if tail := toolNarrationFilter.Flush(); tail != "" {
+			processClaudeText(tail, false, true)
+		}
 		if eventThinkingOpen {
 			sendText("", 3)
 		}
@@ -1272,6 +1332,40 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			inputTokens = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, toolUses = mergeEmbeddedToolUses(outputContent, toolUses)
+		for _, tu := range toolUses {
+			if streamedToolUseIDs[tu.ToolUseID] {
+				continue
+			}
+			ensureMessageStart()
+			closeActiveBlock()
+			idx := nextContentIndex
+			nextContentIndex++
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    tu.ToolUseID,
+					"name":  tu.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+			inputJSON := MarshalToolUseArguments(tu)
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": string(inputJSON),
+				},
+			})
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+			streamedToolUseIDs[tu.ToolUseID] = true
+		}
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
 			thinkingOutput = extractedReasoning
@@ -1528,6 +1622,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		finalContent, toolUses = mergeEmbeddedToolUses(finalContent, toolUses)
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
 			rawThinkingContent = extractedReasoning
@@ -1633,11 +1728,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveOpenAIThinkingMode(&req, thinkingCfg.Suffix)
+	actualModel, thinking, agentic, chatOnly := ParseModelThinkingAndAgentic(req.Model, thinkingCfg.Suffix)
+	thinking = enrichOpenAIThinking(thinking, r.Header, body, &req)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	kiroPayload := OpenAIToKiro(&req, thinking, agentic, chatOnly)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
@@ -1681,11 +1777,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		var toolCalls []ToolCall
 		var toolCallIndex int
+		toolIndexByID := make(map[string]int)
+		openAIToolStarted := make(map[string]bool)
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
+		var toolNarrationFilter ToolNarrationStreamFilter
 		var textBuffer string
 		var inThinkingBlock bool
 		var dropTagThinking bool
@@ -1907,46 +2006,114 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					rawReasoningBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
+					text = toolNarrationFilter.Process(text)
 				}
 				processText(text, isThinking, false)
 			},
-			OnToolUse: func(tu KiroToolUse) {
+			OnToolUseStart: func(tu KiroToolUse) {
+				openAIToolStarted[tu.ToolUseID] = true
 				processText("", false, true)
+				idx := toolCallIndex
+				toolCallIndex++
+				toolIndexByID[tu.ToolUseID] = idx
+				openAIToolStarted[tu.ToolUseID] = true
 
-				args, _ := json.Marshal(tu.Input)
-				rawContentBuilder.WriteString(tu.Name)
-				rawContentBuilder.Write(args)
-				tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
-				tc.Function.Name = tu.Name
-				tc.Function.Arguments = string(args)
-				toolCalls = append(toolCalls, tc)
-
+				delta := map[string]interface{}{"tool_calls": []map[string]interface{}{{
+					"index": idx,
+					"id":    tu.ToolUseID,
+					"type":  "function",
+					"function": map[string]string{
+						"name":      tu.Name,
+						"arguments": "",
+					},
+				}}}
+				if !responseStarted {
+					delta["role"] = "assistant"
+				}
 				chunk := map[string]interface{}{
-					"id":      chatID,
-					"object":  "chat.completion.chunk",
-					"created": time.Now().Unix(),
-					"model":   model,
+					"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+					"choices": []map[string]interface{}{{"index": 0, "delta": delta, "finish_reason": nil}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+				flusher.Flush()
+				responseStarted = true
+			},
+			OnToolUseInputDelta: func(toolUseID, partialJSON string) {
+				if partialJSON == "" {
+					return
+				}
+				idx, ok := toolIndexByID[toolUseID]
+				if !ok {
+					return
+				}
+				chunk := map[string]interface{}{
+					"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
 					"choices": []map[string]interface{}{{
 						"index": 0,
 						"delta": map[string]interface{}{
 							"tool_calls": []map[string]interface{}{{
-								"index": toolCallIndex,
-								"id":    tu.ToolUseID,
-								"type":  "function",
+								"index": idx,
 								"function": map[string]string{
-									"name":      tu.Name,
-									"arguments": string(args),
+									"arguments": partialJSON,
 								},
 							}},
 						},
 						"finish_reason": nil,
 					}},
 				}
-				toolCallIndex++
 				data, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
-				responseStarted = true
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				processText("", false, true)
+
+				args := MarshalToolUseArguments(tu)
+				rawContentBuilder.WriteString(tu.Name)
+				rawContentBuilder.WriteString(args)
+				tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
+				tc.Function.Name = tu.Name
+				tc.Function.Arguments = string(args)
+				toolCalls = append(toolCalls, tc)
+
+				if !openAIToolStarted[tu.ToolUseID] {
+					idx := toolCallIndex
+					toolCallIndex++
+					toolIndexByID[tu.ToolUseID] = idx
+					startDelta := map[string]interface{}{"tool_calls": []map[string]interface{}{{
+						"index": idx, "id": tu.ToolUseID, "type": "function",
+						"function": map[string]string{"name": tu.Name, "arguments": ""},
+					}}}
+					if !responseStarted {
+						startDelta["role"] = "assistant"
+					}
+					chunk := map[string]interface{}{
+						"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+						"choices": []map[string]interface{}{{"index": 0, "delta": startDelta, "finish_reason": nil}},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", string(data))
+					flusher.Flush()
+					responseStarted = true
+
+					argChunk := map[string]interface{}{
+						"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+						"choices": []map[string]interface{}{{
+							"index": 0,
+							"delta": map[string]interface{}{
+								"tool_calls": []map[string]interface{}{{
+									"index":    idx,
+									"function": map[string]string{"arguments": string(args)},
+								}},
+							},
+							"finish_reason": nil,
+						}},
+					}
+					data, _ = json.Marshal(argChunk)
+					fmt.Fprintf(w, "data: %s\n\n", string(data))
+					flusher.Flush()
+				}
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -1974,6 +2141,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		processText("", false, true)
+		if tail := toolNarrationFilter.Flush(); tail != "" {
+			processText(tail, false, true)
+		}
 		if eventThinkingOpen {
 			sendChunk("", 3)
 		}
@@ -1984,6 +2154,56 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			inputTokens = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		var embeddedTools []KiroToolUse
+		outputContent, embeddedTools = mergeEmbeddedToolUses(outputContent, embeddedTools)
+		for _, tu := range embeddedTools {
+			args := MarshalToolUseArguments(tu)
+			tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
+			tc.Function.Name = tu.Name
+			tc.Function.Arguments = string(args)
+			toolCalls = append(toolCalls, tc)
+
+			if openAIToolStarted[tu.ToolUseID] {
+				continue
+			}
+			idx := toolCallIndex
+			toolCallIndex++
+			toolIndexByID[tu.ToolUseID] = idx
+			openAIToolStarted[tu.ToolUseID] = true
+
+			startDelta := map[string]interface{}{"tool_calls": []map[string]interface{}{{
+				"index": idx, "id": tu.ToolUseID, "type": "function",
+				"function": map[string]string{"name": tu.Name, "arguments": ""},
+			}}}
+			if !responseStarted {
+				startDelta["role"] = "assistant"
+			}
+			chunk := map[string]interface{}{
+				"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+				"choices": []map[string]interface{}{{"index": 0, "delta": startDelta, "finish_reason": nil}},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+			responseStarted = true
+
+			argChunk := map[string]interface{}{
+				"id": chatID, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+				"choices": []map[string]interface{}{{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{{
+							"index":    idx,
+							"function": map[string]string{"arguments": string(args)},
+						}},
+					},
+					"finish_reason": nil,
+				}},
+			}
+			data, _ = json.Marshal(argChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+		}
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
 			reasoningOutput = extractedReasoning
@@ -2089,6 +2309,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		finalContent, toolUses = mergeEmbeddedToolUses(finalContent, toolUses)
 		if thinking && reasoningContent == "" && extractedReasoning != "" {
 			reasoningContent = extractedReasoning
 		} else if !thinking {
@@ -3483,7 +3704,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		MaxTokens: 5,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq, thinking, false, false)
 
 	var content string
 	callback := &KiroStreamCallback{

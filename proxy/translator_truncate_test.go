@@ -31,7 +31,7 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 		Messages: msgs,
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, false, false)
 
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -59,13 +59,9 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 		t.Fatalf("expected a truncation placeholder in history")
 	}
 
-	// System priming should still be at the front.
-	if len(payload.ConversationState.History) < 2 {
-		t.Fatalf("expected priming retained, history too short")
-	}
-	primingUser := payload.ConversationState.History[0].UserInputMessage
-	if primingUser == nil || !strings.Contains(primingUser.Content, "helpful assistant") {
-		t.Fatalf("expected system priming retained at front")
+	// System is not re-injected on multi-turn payloads with long history.
+	if strings.Contains(cur.Content, "helpful assistant") {
+		t.Fatalf("expected system not duplicated in multi-turn truncate payload")
 	}
 }
 
@@ -81,7 +77,7 @@ func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
 			{Role: "user", Content: "how are you?"},
 		},
 	}
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, false, false)
 	for _, h := range payload.ConversationState.History {
 		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
 			t.Fatalf("small payload should not be truncated")

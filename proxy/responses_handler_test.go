@@ -8,6 +8,7 @@ import (
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,11 +59,24 @@ func TestResponsesParseArrayInput(t *testing.T) {
 	}
 }
 
-func TestResponsesStoreAndLoad(t *testing.T) {
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
+func initConfigForTest(t *testing.T) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "kirogo-config-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	cfgFile := filepath.Join(dir, "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	t.Cleanup(func() {
+		clearStoredResponsesDir()
+		_ = os.RemoveAll(dir)
+	})
+}
+
+func TestResponsesStoreAndLoad(t *testing.T) {
+	initConfigForTest(t)
 
 	resp := &ResponsesObject{
 		ID:        "resp_unit_test_001",
@@ -149,10 +163,7 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 // inputs/outputs must appear before C's. Previously only C's direct parent
 // (B) was emitted, dropping A entirely.
 func TestResponsesPreviousResponseIDExpandsFullChain(t *testing.T) {
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
+	initConfigForTest(t)
 
 	a := &ResponsesObject{
 		ID:           "resp_a",
@@ -259,7 +270,11 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 
 func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 	t.Helper()
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	dir, err := os.MkdirTemp("", "kirogo-responses-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	cfgFile := filepath.Join(dir, "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -283,8 +298,11 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		pool:        p,
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
-	cleanup := func() {}
-	return h, cleanup
+	t.Cleanup(func() {
+		clearStoredResponsesDir()
+		_ = os.RemoveAll(dir)
+	})
+	return h, func() {}
 }
 
 func swapKiroEndpointsForTest(t *testing.T, server *httptest.Server) func() {
@@ -389,5 +407,76 @@ func TestResponsesStreamSSE(t *testing.T) {
 	}
 	if !strings.Contains(bodyStr, "stream chunk") {
 		t.Fatalf("expected stream content delta, got:\n%s", bodyStr)
+	}
+}
+
+func TestResponsesGetByID(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	stored := &ResponsesObject{
+		ID:        "resp_get_test",
+		Object:    "response",
+		Status:    "completed",
+		Model:     "claude-sonnet-4.5",
+		CreatedAt: time.Now().Unix(),
+		Output: []ResponseOutputItem{{
+			Type: "message", Role: "assistant", Status: "completed",
+			Content: []ResponseContentPart{{Type: "output_text", Text: "hello stored"}},
+		}},
+	}
+	if err := saveResponse(stored); err != nil {
+		t.Fatalf("saveResponse: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses/resp_get_test", nil)
+	rec := httptest.NewRecorder()
+	h.handleGetResponse(rec, req, "resp_get_test")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var got ResponsesObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ID != "resp_get_test" || got.Output[0].Content[0].Text != "hello stored" {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+
+	missing := httptest.NewRequest(http.MethodGet, "/v1/responses/resp_missing", nil)
+	missingRec := httptest.NewRecorder()
+	h.handleGetResponse(missingRec, missing, "resp_missing")
+	if missingRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", missingRec.Code)
+	}
+}
+
+func TestBuildOpenAIRequestFromResponsesForwardsFields(t *testing.T) {
+	topP := 0.9
+	maxOut := 1000
+	temp := 0.2
+	req := &ResponsesRequest{
+		Model:           "claude-sonnet-4.5",
+		ToolChoice:      json.RawMessage(`"required"`),
+		TopP:            &topP,
+		MaxOutputTokens: &maxOut,
+		Temperature:     &temp,
+		Reasoning:       json.RawMessage(`{"effort":"high"}`),
+		Text:            json.RawMessage(`{"format":{"type":"json_object"}}`),
+	}
+
+	out := buildOpenAIRequestFromResponses(req, []OpenAIMessage{{Role: "user", Content: "hi"}})
+	if out.TopP != topP || out.MaxTokens != maxOut || out.Temperature != temp {
+		t.Fatalf("unexpected inference fields: %+v", out)
+	}
+	if out.ReasoningEffort != "high" {
+		t.Fatalf("expected reasoning effort high, got %q", out.ReasoningEffort)
+	}
+	if out.ResponseFormat == nil || out.ResponseFormat["type"] != "json_object" {
+		t.Fatalf("expected json_object response format, got %#v", out.ResponseFormat)
+	}
+	if choice, ok := out.ToolChoice.(string); !ok || choice != "required" {
+		t.Fatalf("expected required tool_choice, got %#v", out.ToolChoice)
 	}
 }

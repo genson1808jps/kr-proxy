@@ -218,9 +218,11 @@ type KiroAssistantResponseMessage struct {
 }
 
 type KiroToolUse struct {
-	ToolUseID string                 `json:"toolUseId"`
-	Name      string                 `json:"name"`
-	Input     map[string]interface{} `json:"input"`
+	ToolUseID      string                 `json:"toolUseId"`
+	Name           string                 `json:"name"`
+	Input          map[string]interface{} `json:"input"`
+	IsTruncated    bool                   `json:"-"`
+	TruncationInfo *TruncationInfo        `json:"-"`
 }
 
 type InferenceConfig struct {
@@ -233,12 +235,14 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
-	OnText         func(text string, isThinking bool)
-	OnToolUse      func(toolUse KiroToolUse)
-	OnComplete     func(inputTokens, outputTokens int)
-	OnError        func(err error)
-	OnCredits      func(credits float64)
-	OnContextUsage func(percentage float64)
+	OnText              func(text string, isThinking bool)
+	OnToolUseStart      func(toolUse KiroToolUse)
+	OnToolUseInputDelta func(toolUseID, partialJSON string)
+	OnToolUse           func(toolUse KiroToolUse)
+	OnComplete          func(inputTokens, outputTokens int)
+	OnError             func(err error)
+	OnCredits           func(credits float64)
+	OnContextUsage      func(percentage float64)
 }
 
 // ==================== API Call ====================
@@ -709,43 +713,78 @@ func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
 // ==================== Tool Use Handling ====================
 
 type toolUseState struct {
-	ToolUseID   string
-	Name        string
-	InputBuffer strings.Builder
-	GeneratedID bool
+	ToolUseID    string
+	Name         string
+	InputBuffer  strings.Builder
+	GeneratedID  bool
+	Started      bool
+	DeltaEmitted bool
 }
 
 func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) *toolUseState {
-	toolUseID := firstStringField(event, "toolUseId", "toolUseID", "tool_use_id", "id")
-	name := firstStringField(event, "name", "toolName", "tool_name")
-	isStop := firstBoolField(event, "stop", "isStop", "done")
+	tu := event
+	if nested, ok := event["toolUseEvent"].(map[string]interface{}); ok {
+		tu = nested
+	}
+
+	toolUseID := firstStringField(tu, "toolUseId", "toolUseID", "tool_use_id", "id")
+	name := firstStringField(tu, "name", "toolName", "tool_name")
+	isStop := firstBoolField(tu, "stop", "isStop", "done")
+
+	var inputFragment string
+	var inputMap map[string]interface{}
+	if inputRaw, ok := tu["input"]; ok {
+		switch v := inputRaw.(type) {
+		case string:
+			inputFragment = v
+		case map[string]interface{}:
+			inputMap = v
+		}
+	}
+
+	startTool := func(id, toolName string, generated bool) *toolUseState {
+		state := &toolUseState{ToolUseID: id, Name: toolName, GeneratedID: generated}
+		if callback != nil && callback.OnToolUseStart != nil {
+			callback.OnToolUseStart(KiroToolUse{ToolUseID: id, Name: toolName, Input: map[string]interface{}{}})
+			state.Started = true
+		}
+		return state
+	}
 
 	if toolUseID != "" && name != "" {
 		if current == nil {
-			current = &toolUseState{ToolUseID: toolUseID, Name: name}
+			current = startTool(toolUseID, name, false)
 		} else if current.ToolUseID != toolUseID {
 			if current.GeneratedID && current.Name == name {
 				current.ToolUseID = toolUseID
 				current.GeneratedID = false
 			} else {
 				finishToolUse(current, callback)
-				current = &toolUseState{ToolUseID: toolUseID, Name: name}
+				current = startTool(toolUseID, name, false)
 			}
 		}
 	} else if name != "" && current == nil {
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		current = startTool("toolu_"+uuid.New().String(), name, true)
 	} else if name != "" && current != nil && current.Name != name {
 		finishToolUse(current, callback)
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		current = startTool("toolu_"+uuid.New().String(), name, true)
 	}
 
-	if current != nil {
-		if input, ok := event["input"].(string); ok {
-			current.InputBuffer.WriteString(input)
-		} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
-			data, _ := json.Marshal(inputObj)
-			current.InputBuffer.Reset()
-			current.InputBuffer.Write(data)
+	if current != nil && inputFragment != "" {
+		current.InputBuffer.WriteString(inputFragment)
+		if callback != nil && callback.OnToolUseInputDelta != nil {
+			callback.OnToolUseInputDelta(current.ToolUseID, inputFragment)
+			current.DeltaEmitted = true
+		}
+	}
+
+	if current != nil && inputMap != nil {
+		data, _ := json.Marshal(inputMap)
+		current.InputBuffer.Reset()
+		current.InputBuffer.Write(data)
+		if callback != nil && callback.OnToolUseInputDelta != nil {
+			callback.OnToolUseInputDelta(current.ToolUseID, string(data))
+			current.DeltaEmitted = true
 		}
 	}
 
@@ -764,18 +803,36 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 	if state.ToolUseID == "" {
 		state.ToolUseID = "toolu_" + uuid.New().String()
 	}
-	var input map[string]interface{}
-	if state.InputBuffer.Len() > 0 {
-		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
+	rawInput := state.InputBuffer.String()
+	input := parseToolInputMap(rawInput)
+	truncInfo := DetectTruncation(state.Name, state.ToolUseID, rawInput, input)
+	if truncInfo.IsTruncated {
+		logger.Warnf("[KiroAPI] TRUNCATION DETECTED for tool %s (ID: %s): type=%s, raw_size=%d bytes",
+			state.Name, state.ToolUseID, truncInfo.TruncationType, len(rawInput))
+		logger.Warnf("[KiroAPI] truncation details: %s", truncInfo.ErrorMessage)
+		if summary := GetTruncationSummary(truncInfo); summary != "" {
+			logger.Infof("[KiroAPI] truncation summary: %s", summary)
+		}
 	}
-	if input == nil {
-		input = make(map[string]interface{})
+	if !state.Started && callback.OnToolUseStart != nil {
+		callback.OnToolUseStart(KiroToolUse{ToolUseID: state.ToolUseID, Name: state.Name, Input: map[string]interface{}{}})
+		state.Started = true
 	}
-	callback.OnToolUse(KiroToolUse{
-		ToolUseID: state.ToolUseID,
-		Name:      state.Name,
-		Input:     input,
-	})
+	if !state.DeltaEmitted && state.InputBuffer.Len() > 0 && callback.OnToolUseInputDelta != nil {
+		if b, err := json.Marshal(input); err == nil {
+			callback.OnToolUseInputDelta(state.ToolUseID, string(b))
+		}
+	}
+	toolUse := KiroToolUse{
+		ToolUseID:   state.ToolUseID,
+		Name:        state.Name,
+		Input:       input,
+		IsTruncated: truncInfo.IsTruncated,
+	}
+	if truncInfo.IsTruncated {
+		toolUse.TruncationInfo = &truncInfo
+	}
+	callback.OnToolUse(toolUse)
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {

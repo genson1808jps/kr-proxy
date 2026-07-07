@@ -51,58 +51,40 @@ func TestOpenAIToKiroPreservesStructuredAssistantAndToolContent(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, false, false)
 
-	// History starts with a priming pair.
-	if len(payload.ConversationState.History) != 4 {
-		t.Fatalf("expected 4 history items (2 priming + 2 conversation), got %d", len(payload.ConversationState.History))
-	}
-
-	// history[0]: priming user
-	primingUser := payload.ConversationState.History[0].UserInputMessage
-	if primingUser == nil {
-		t.Fatalf("expected history[0] to be priming user message")
-	}
-	if !strings.Contains(primingUser.Content, "system-a") || !strings.Contains(primingUser.Content, "system-b") {
-		t.Fatalf("expected priming user message to contain system prompt, got %q", primingUser.Content)
-	}
-	if strings.Contains(primingUser.Content, "first-question") {
-		t.Fatalf("expected system prompt priming not to contain user question, got %q", primingUser.Content)
+	if len(payload.ConversationState.History) != 2 {
+		t.Fatalf("expected 2 history items (user + assistant), got %d", len(payload.ConversationState.History))
 	}
 
-	// history[1]: priming assistant
-	primingAssistant := payload.ConversationState.History[1].AssistantResponseMessage
-	if primingAssistant == nil {
-		t.Fatalf("expected history[1] to be priming assistant message")
-	}
-	if primingAssistant.Content != "I will follow these instructions." {
-		t.Fatalf("expected priming assistant ack, got %q", primingAssistant.Content)
-	}
-
-	// history[2]: first user turn
-	firstConvUser := payload.ConversationState.History[2].UserInputMessage
+	// history[0]: first user turn
+	firstConvUser := payload.ConversationState.History[0].UserInputMessage
 	if firstConvUser == nil {
-		t.Fatalf("expected history[2] to be first conversation user message")
+		t.Fatalf("expected history[0] to be first conversation user message")
 	}
 	if !strings.Contains(firstConvUser.Content, "first-question") {
-		t.Fatalf("expected history[2] to contain first-question, got %q", firstConvUser.Content)
+		t.Fatalf("expected history[0] to contain first-question, got %q", firstConvUser.Content)
 	}
 
-	// history[3]: assistant reply
-	historyAssistant := payload.ConversationState.History[3].AssistantResponseMessage
+	// history[1]: assistant reply
+	historyAssistant := payload.ConversationState.History[1].AssistantResponseMessage
 	if historyAssistant == nil {
-		t.Fatalf("expected history[3] to be assistant message")
+		t.Fatalf("expected history[1] to be assistant message")
 	}
 	if historyAssistant.Content != "assistant-structured" {
 		t.Fatalf("expected assistant structured content to be preserved, got %q", historyAssistant.Content)
 	}
 
+	// Current message: system is not re-injected when history exists.
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if strings.Contains(cur.Content, "system-a") {
+		t.Fatalf("expected system not re-injected when history exists, got %q", cur.Content)
+	}
 	// The tool result answers call_1, but the last history assistant has no
 	// matching structured tool call (it is text-only), so the tool result is an
 	// orphan. Kiro's upstream rejects structured tool results that do not answer
 	// the immediately preceding assistant tool call, so it must be narrated into
 	// the current message text rather than kept structured.
-	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if !strings.Contains(cur.Content, "tool-result-structured") {
 		t.Fatalf("expected tool-result continuation content, got %q", cur.Content)
 	}
@@ -121,7 +103,7 @@ func TestOpenAIToKiroAssistantMapContentInHistory(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, false, false)
 
 	if len(payload.ConversationState.History) != 2 {
 		t.Fatalf("expected 2 history entries, got %d", len(payload.ConversationState.History))
@@ -156,7 +138,7 @@ func TestOpenAIToKiroAssistantToolCallsDoNotInjectPlaceholder(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, false, false)
 
 	// The mid-history assistant turn carried ONLY a tool call (no text) and is
 	// not the active tool turn, so its structured toolUses are cleared. That
@@ -191,8 +173,8 @@ func TestOpenAIConversationIDStableFromAnchor(t *testing.T) {
 	reqA := &OpenAIRequest{Model: "claude-sonnet-4.5", Messages: baseMessages}
 	reqB := &OpenAIRequest{Model: "claude-sonnet-4.5", Messages: append(baseMessages, OpenAIMessage{Role: "assistant", Content: "Next step"})}
 
-	payloadA := OpenAIToKiro(reqA, false)
-	payloadB := OpenAIToKiro(reqB, false)
+	payloadA := OpenAIToKiro(reqA, false, false, false)
+	payloadB := OpenAIToKiro(reqB, false, false, false)
 
 	if payloadA.ConversationState.ConversationID == "" || payloadB.ConversationState.ConversationID == "" {
 		t.Fatalf("expected non-empty conversation IDs")
@@ -220,8 +202,8 @@ func TestClaudeConversationIDStableFromAnchor(t *testing.T) {
 		},
 	}
 
-	payloadA := ClaudeToKiro(reqA, false)
-	payloadB := ClaudeToKiro(reqB, false)
+	payloadA := ClaudeToKiro(reqA, false, false, false)
+	payloadB := ClaudeToKiro(reqB, false, false, false)
 
 	if payloadA.ConversationState.ConversationID == "" || payloadB.ConversationState.ConversationID == "" {
 		t.Fatalf("expected non-empty conversation IDs")
@@ -239,8 +221,8 @@ func TestOpenAIConversationIDRandomForSyntheticAnchor(t *testing.T) {
 		},
 	}
 
-	payloadA := OpenAIToKiro(req, false)
-	payloadB := OpenAIToKiro(req, false)
+	payloadA := OpenAIToKiro(req, false, false, false)
+	payloadB := OpenAIToKiro(req, false, false, false)
 
 	if payloadA.ConversationState.ConversationID == payloadB.ConversationState.ConversationID {
 		t.Fatalf("expected synthetic anchor to generate non-deterministic conversation IDs")
@@ -256,7 +238,7 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, false, false)
 
 	if len(payload.ConversationState.History) != 0 {
 		t.Fatalf("expected leading assistant-only history to be dropped, got %d entries", len(payload.ConversationState.History))
@@ -301,7 +283,7 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, false, false)
 	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
 
 	if !strings.Contains(content, toolResultsContinuationPrefix) {
@@ -517,7 +499,7 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, false, false)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected tool_result image attached to current message, got %d images", len(cur.Images))
@@ -568,7 +550,7 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, false, false)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
@@ -601,7 +583,7 @@ func TestOpenAIToolResultImageAttachedToCurrentMessage(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, false, false)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected tool image attached to current message, got %d", len(cur.Images))
@@ -641,7 +623,7 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, false, false)
 
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {

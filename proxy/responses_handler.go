@@ -6,6 +6,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -13,8 +14,8 @@ import (
 const defaultResponsesModel = "claude-sonnet-4.5"
 
 func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method Not Allowed", 405)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -90,25 +91,15 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	openaiReq := &OpenAIRequest{
-		Model:    req.Model,
-		Messages: finalMessages,
-		Stream:   req.Stream,
-		Tools:    req.Tools,
-	}
-	if req.Temperature != nil {
-		openaiReq.Temperature = *req.Temperature
-	}
-	if req.MaxOutputTokens != nil {
-		openaiReq.MaxTokens = *req.MaxOutputTokens
-	}
+	openaiReq := buildOpenAIRequestFromResponses(&req, finalMessages)
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking, agentic, chatOnly := ParseModelThinkingAndAgentic(openaiReq.Model, thinkingCfg.Suffix)
+	thinking = enrichOpenAIThinking(thinking, nil, nil, openaiReq)
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq, thinking, agentic, chatOnly)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
@@ -214,6 +205,27 @@ func (h *Handler) handleResponsesNonStream(
 	h.sendOpenAIErrorFromUpstream(w, lastErr)
 }
 
+func (h *Handler) handleGetResponse(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	resp, err := loadResponse(id)
+	if err != nil {
+		if os.IsNotExist(err) {
+			h.sendOpenAIError(w, http.StatusNotFound, "invalid_request_error",
+				fmt.Sprintf("Response with id '%s' not found.", id))
+			return
+		}
+		h.sendOpenAIError(w, http.StatusNotFound, "invalid_request_error", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(resp)
+}
+
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
 	inputTokens, outputTokens int, req *ResponsesRequest,
@@ -234,14 +246,13 @@ func buildResponsesObject(
 	}
 
 	for _, tu := range toolUses {
-		args, _ := json.Marshal(tu.Input)
 		output = append(output, ResponseOutputItem{
 			ID:        generateOutputItemID("fc"),
 			Type:      "function_call",
 			Status:    "completed",
 			CallID:    tu.ToolUseID,
 			Name:      tu.Name,
-			Arguments: string(args),
+			Arguments: MarshalToolUseArguments(tu),
 		})
 	}
 
@@ -335,19 +346,70 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText             strings.Builder
+			reasoningText        strings.Builder
+			toolUses             []KiroToolUse
+			inputTokens          int
+			outputTokens         int
+			credits              float64
+			realInputTokens      int
+			toolNarrationFilter  ToolNarrationStreamFilter
 		)
 
 		messageItemID := generateOutputItemID("msg")
 		messageStarted := false
 		outputIndex := 0
 		contentIndex := 0
+		fcIDByToolUseID := make(map[string]string)
+		toolOutputIndexByID := make(map[string]int)
+		toolStreamStarted := make(map[string]bool)
+
+		finalizeMessageIfStarted := func() {
+			if !messageStarted {
+				return
+			}
+			send("response.content_part.done", map[string]interface{}{
+				"type":          "response.content_part.done",
+				"item_id":       messageItemID,
+				"output_index":  outputIndex,
+				"content_index": contentIndex,
+				"part": map[string]interface{}{
+					"type": "output_text",
+					"text": fullText.String(),
+				},
+			})
+			send("response.output_item.done", map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": outputIndex,
+				"item": map[string]interface{}{
+					"id":     messageItemID,
+					"type":   "message",
+					"role":   "assistant",
+					"status": "completed",
+					"content": []map[string]interface{}{{
+						"type": "output_text",
+						"text": fullText.String(),
+					}},
+				},
+			})
+			messageStarted = false
+			outputIndex++
+		}
+
+		emitFunctionCallDone := func(tu KiroToolUse, fcID string, idx int, args string) {
+			send("response.output_item.done", map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": idx,
+				"item": map[string]interface{}{
+					"id":        fcID,
+					"type":      "function_call",
+					"status":    "completed",
+					"call_id":   tu.ToolUseID,
+					"name":      tu.Name,
+					"arguments": string(args),
+				},
+			})
+		}
 
 		ensureMessageStarted := func() {
 			if messageStarted {
@@ -387,49 +449,26 @@ func (h *Handler) handleResponsesStream(
 					return
 				}
 				fullText.WriteString(text)
+				filtered := toolNarrationFilter.Process(text)
+				if filtered == "" {
+					return
+				}
 				ensureMessageStarted()
 				send("response.output_text.delta", map[string]interface{}{
 					"type":          "response.output_text.delta",
 					"item_id":       messageItemID,
 					"output_index":  outputIndex,
 					"content_index": contentIndex,
-					"delta":         text,
+					"delta":         filtered,
 				})
 				responseStarted = true
 			},
-			OnToolUse: func(tu KiroToolUse) {
-				if messageStarted {
-					send("response.content_part.done", map[string]interface{}{
-						"type":          "response.content_part.done",
-						"item_id":       messageItemID,
-						"output_index":  outputIndex,
-						"content_index": contentIndex,
-						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": fullText.String(),
-						},
-					})
-					send("response.output_item.done", map[string]interface{}{
-						"type":         "response.output_item.done",
-						"output_index": outputIndex,
-						"item": map[string]interface{}{
-							"id":     messageItemID,
-							"type":   "message",
-							"role":   "assistant",
-							"status": "completed",
-							"content": []map[string]interface{}{{
-								"type": "output_text",
-								"text": fullText.String(),
-							}},
-						},
-					})
-					messageStarted = false
-					outputIndex++
-				}
-
-				toolUses = append(toolUses, tu)
-				args, _ := json.Marshal(tu.Input)
+			OnToolUseStart: func(tu KiroToolUse) {
+				finalizeMessageIfStarted()
 				fcID := generateOutputItemID("fc")
+				fcIDByToolUseID[tu.ToolUseID] = fcID
+				toolOutputIndexByID[tu.ToolUseID] = outputIndex
+				toolStreamStarted[tu.ToolUseID] = true
 				send("response.output_item.added", map[string]interface{}{
 					"type":         "response.output_item.added",
 					"output_index": outputIndex,
@@ -442,24 +481,58 @@ func (h *Handler) handleResponsesStream(
 						"arguments": "",
 					},
 				})
+				responseStarted = true
+			},
+			OnToolUseInputDelta: func(toolUseID, partialJSON string) {
+				if partialJSON == "" {
+					return
+				}
+				fcID, ok := fcIDByToolUseID[toolUseID]
+				idx, okIdx := toolOutputIndexByID[toolUseID]
+				if !ok || !okIdx {
+					return
+				}
 				send("response.function_call_arguments.delta", map[string]interface{}{
 					"type":         "response.function_call_arguments.delta",
 					"item_id":      fcID,
-					"output_index": outputIndex,
-					"delta":        string(args),
+					"output_index": idx,
+					"delta":        partialJSON,
 				})
-				send("response.output_item.done", map[string]interface{}{
-					"type":         "response.output_item.done",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "completed",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": string(args),
-					},
-				})
+				responseStarted = true
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				args := MarshalToolUseArguments(tu)
+				toolUses = append(toolUses, tu)
+
+				fcID, streamed := fcIDByToolUseID[tu.ToolUseID]
+				idx := toolOutputIndexByID[tu.ToolUseID]
+				if !streamed {
+					finalizeMessageIfStarted()
+					fcID = generateOutputItemID("fc")
+					idx = outputIndex
+					send("response.output_item.added", map[string]interface{}{
+						"type":         "response.output_item.added",
+						"output_index": idx,
+						"item": map[string]interface{}{
+							"id":        fcID,
+							"type":      "function_call",
+							"status":    "in_progress",
+							"call_id":   tu.ToolUseID,
+							"name":      tu.Name,
+							"arguments": "",
+						},
+					})
+					send("response.function_call_arguments.delta", map[string]interface{}{
+						"type":         "response.function_call_arguments.delta",
+						"item_id":      fcID,
+						"output_index": idx,
+						"delta":        string(args),
+					})
+				}
+				emitFunctionCallDone(tu, fcID, idx, args)
+				delete(fcIDByToolUseID, tu.ToolUseID)
+				delete(toolOutputIndexByID, tu.ToolUseID)
+				delete(toolStreamStarted, tu.ToolUseID)
 				outputIndex++
 				responseStarted = true
 			},
@@ -494,7 +567,42 @@ func (h *Handler) handleResponsesStream(
 			return
 		}
 
-		finalContent, _ := extractThinkingFromContent(fullText.String())
+		rawContent := fullText.String()
+		if tail := toolNarrationFilter.Flush(); tail != "" {
+			rawContent += tail
+		}
+		finalContent, _ := extractThinkingFromContent(rawContent)
+		finalContent, toolUses = mergeEmbeddedToolUses(finalContent, toolUses)
+		for _, tu := range toolUses {
+			if toolStreamStarted[tu.ToolUseID] {
+				continue
+			}
+			args := MarshalToolUseArguments(tu)
+			finalizeMessageIfStarted()
+			fcID := generateOutputItemID("fc")
+			idx := outputIndex
+			send("response.output_item.added", map[string]interface{}{
+				"type":         "response.output_item.added",
+				"output_index": idx,
+				"item": map[string]interface{}{
+					"id":        fcID,
+					"type":      "function_call",
+					"status":    "in_progress",
+					"call_id":   tu.ToolUseID,
+					"name":      tu.Name,
+					"arguments": "",
+				},
+			})
+			send("response.function_call_arguments.delta", map[string]interface{}{
+				"type":         "response.function_call_arguments.delta",
+				"item_id":      fcID,
+				"output_index": idx,
+				"delta":        string(args),
+			})
+			emitFunctionCallDone(tu, fcID, idx, args)
+			outputIndex++
+			toolStreamStarted[tu.ToolUseID] = true
+		}
 		reasoning := reasoningText.String()
 		if !thinking {
 			reasoning = ""
@@ -586,4 +694,46 @@ func (h *Handler) handleResponsesStream(
 			},
 		},
 	})
+}
+
+func buildOpenAIRequestFromResponses(req *ResponsesRequest, messages []OpenAIMessage) *OpenAIRequest {
+	out := &OpenAIRequest{
+		Model:    req.Model,
+		Messages: messages,
+		Stream:   req.Stream,
+		Tools:    req.Tools,
+	}
+	if req.Temperature != nil {
+		out.Temperature = *req.Temperature
+	}
+	if req.TopP != nil {
+		out.TopP = *req.TopP
+	}
+	if req.MaxOutputTokens != nil {
+		out.MaxTokens = *req.MaxOutputTokens
+	}
+	if len(req.ToolChoice) > 0 && string(req.ToolChoice) != "null" {
+		var toolChoice interface{}
+		if err := json.Unmarshal(req.ToolChoice, &toolChoice); err == nil {
+			out.ToolChoice = toolChoice
+		}
+	}
+	if len(req.Reasoning) > 0 {
+		var reasoning map[string]interface{}
+		if err := json.Unmarshal(req.Reasoning, &reasoning); err == nil {
+			if effort, ok := reasoning["effort"].(string); ok {
+				out.ReasoningEffort = effort
+			}
+		}
+	}
+	if len(req.Text) > 0 {
+		var textObj map[string]interface{}
+		if err := json.Unmarshal(req.Text, &textObj); err == nil {
+			if format, ok := textObj["format"].(map[string]interface{}); ok {
+				out.ResponseFormat = format
+			}
+		}
+	}
+	out.ForceSystemInject = strings.TrimSpace(req.Instructions) != ""
+	return out
 }

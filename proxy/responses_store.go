@@ -145,6 +145,34 @@ func logResponsesPersistFailure(id string, err error) {
 	logger.Warnf("[Responses] persist %s failed: %v", id, err)
 }
 
+func clearStoredResponsesDir() {
+	dir := responsesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+		_ = os.Remove(filepath.Join(dir, e.Name()+".tmp"))
+	}
+}
+
+func responseIDFromPath(path string) (string, bool) {
+	for _, prefix := range []string{"/v1/responses/", "/responses/"} {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(path, prefix), "/")
+		if id != "" && !strings.Contains(id, "/") {
+			return id, true
+		}
+	}
+	return "", false
+}
+
 func sanitizeResponseID(id string) string {
 	cleaned := strings.Map(func(r rune) rune {
 		switch {

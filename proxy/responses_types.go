@@ -12,7 +12,10 @@ type ResponsesRequest struct {
 	PreviousResponseID string            `json:"previous_response_id,omitempty"`
 	Store              *bool             `json:"store,omitempty"`
 	Temperature        *float64          `json:"temperature,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
 	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
+	Reasoning          json.RawMessage   `json:"reasoning,omitempty"`
+	Text               json.RawMessage   `json:"text,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
 }
 

@@ -40,7 +40,7 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
+<max_thinking_length>16000</max_thinking_length>`
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
@@ -50,8 +50,8 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // Kiro's upstream rejects oversized requests with HTTP 400
 // "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
 // payload exceeds this size we drop the oldest history turns (keeping the
-// system priming, the most recent turns, the active tool turn, and the current
-// message) and insert a placeholder note so the model knows context was elided.
+// most recent turns, the active tool turn, and the current message) and insert
+// a placeholder note so the model knows context was elided.
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
 const maxPayloadBytes = 900 * 1024
@@ -61,7 +61,7 @@ const maxPayloadBytes = 900 * 1024
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
 
 // minRecentHistoryTurns is the number of most-recent history entries always kept
-// (in addition to system priming and the active tool turn) when truncating.
+// (in addition to the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
 
 // kiroModelPrefix is an optional client-facing namespace so agents that reject
@@ -227,12 +227,12 @@ type ClaudeUsage struct {
 
 const maxToolDescLen = 10237
 
-func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+func ClaudeToKiro(req *ClaudeRequest, thinking bool, agentic bool, chatOnly bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
-	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	baseSystem := buildClaudeSystemPrompt(req.System)
+	fullSystem := assembleKiroSystemPrompt(baseSystem, thinking, agentic, req.ToolChoice, nil)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -282,25 +282,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	history = trimLeadingAssistantHistory(history)
 
-	// Keep system instructions in history instead of user content.
-	if systemPrompt != "" {
-		priming := []KiroHistoryMessage{
-			{
-				UserInputMessage: &KiroUserInputMessage{
-					Content: systemPrompt,
-					ModelID: modelID,
-					Origin:  origin,
-				},
-			},
-			{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content: "I will follow these instructions.",
-				},
-			},
-		}
-		history = append(priming, history...)
-	}
-
 	// Decide whether the current tool results form a valid "active" tool turn:
 	// the last history assistant must carry matching structured toolUses. If not
 	// (orphaned tool results, e.g. after context compaction), flatten them into
@@ -316,11 +297,18 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = sanitizeKiroHistory(history, nil)
 	}
 
-	// 构建最终内容
-	finalContent := buildFinalUserContent(currentContent, currentImages, currentToolResults, keepCurrentToolResults)
+	// 构建最终内容 — system prompt embedded in current user turn (cliproxy++ pattern).
+	userBody := buildFinalUserContent(currentContent, currentImages, currentToolResults, keepCurrentToolResults)
+	effectiveSystem := effectiveSystemPromptForTurn(fullSystem, len(history), false)
+	finalContent := embedKiroSystemPrompt(userBody, effectiveSystem)
 
 	// 转换工具
-	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
+	var kiroTools []KiroToolWrapper
+	var toolNameMap map[string]string
+	if !chatOnly && claudeToolsAllowed(req) {
+		kiroTools, toolNameMap = convertClaudeTools(req.Tools)
+		kiroTools = compressToolsIfNeeded(kiroTools)
+	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -328,7 +316,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, fullSystem, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -361,21 +349,81 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	truncatePayloadToLimit(payload)
 
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}) string {
 	systemPrompt := extractSystemPrompt(system)
-	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
-		return systemPrompt
+	return applyPromptFilters(systemPrompt)
+}
+
+// assembleKiroSystemPrompt builds the full system context injected into the
+// current user message (timestamp, tool_choice hints, thinking tags, etc.).
+// Matches cliproxyapi-plusplus ordering.
+func assembleKiroSystemPrompt(baseSystem string, thinking bool, agentic bool, toolChoice interface{}, responseFormat map[string]interface{}) string {
+	systemPrompt := strings.TrimSpace(baseSystem)
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05 MST")
+	timestampContext := fmt.Sprintf("[Context: Current time is %s]", timestamp)
+	if systemPrompt != "" {
+		systemPrompt = timestampContext + "\n\n" + systemPrompt
+	} else {
+		systemPrompt = timestampContext
 	}
-	if systemPrompt == "" {
-		return ThinkingModePrompt
+
+	if agentic {
+		systemPrompt = appendSystemHint(systemPrompt, strings.TrimSpace(kiroAgenticSystemPrompt))
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+
+	if hint := extractToolChoiceHint(toolChoice); hint != "" {
+		systemPrompt = appendSystemHint(systemPrompt, hint)
+	}
+	if hint := extractOpenAIResponseFormatHint(responseFormat); hint != "" {
+		systemPrompt = appendSystemHint(systemPrompt, hint)
+	}
+
+	if thinking {
+		if systemPrompt != "" {
+			systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		} else {
+			systemPrompt = ThinkingModePrompt
+		}
+	}
+
+	return systemPrompt
+}
+
+// effectiveSystemPromptForTurn returns the system block on the first turn, or when
+// ForceSystemInject is set (e.g. Responses API instructions on continuation).
+func effectiveSystemPromptForTurn(fullSystem string, historyLen int, forceInject bool) string {
+	if strings.TrimSpace(fullSystem) == "" {
+		return ""
+	}
+	if historyLen == 0 || forceInject {
+		return fullSystem
+	}
+	return ""
+}
+
+// embedKiroSystemPrompt wraps user content with --- SYSTEM PROMPT --- markers.
+func embedKiroSystemPrompt(content, systemPrompt string) string {
+	var contentBuilder strings.Builder
+
+	if strings.TrimSpace(systemPrompt) != "" {
+		contentBuilder.WriteString("--- SYSTEM PROMPT ---\n")
+		contentBuilder.WriteString(systemPrompt)
+		contentBuilder.WriteString("\n--- END SYSTEM PROMPT ---\n\n")
+	}
+
+	contentBuilder.WriteString(content)
+	finalContent := contentBuilder.String()
+
+	if strings.TrimSpace(finalContent) == "" {
+		return "Continue"
+	}
+	return finalContent
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -973,7 +1021,7 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 			Type:  "tool_use",
 			ID:    tu.ToolUseID,
 			Name:  tu.Name,
-			Input: tu.Input,
+			Input: ToolUseInputForClient(tu),
 		})
 	}
 
@@ -999,16 +1047,17 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model            string                 `json:"model"`
-	Messages         []OpenAIMessage        `json:"messages"`
-	MaxTokens        int                    `json:"max_tokens,omitempty"`
-	Temperature      float64                `json:"temperature,omitempty"`
-	TopP             float64                `json:"top_p,omitempty"`
-	Stream           bool                   `json:"stream,omitempty"`
-	Tools            []OpenAITool           `json:"tools,omitempty"`
-	ToolChoice       interface{}            `json:"tool_choice,omitempty"`
-	ResponseFormat   map[string]interface{} `json:"response_format,omitempty"`
-	ReasoningEffort  string                 `json:"reasoning_effort,omitempty"`
+	Model              string                 `json:"model"`
+	Messages           []OpenAIMessage        `json:"messages"`
+	MaxTokens          int                    `json:"max_tokens,omitempty"`
+	Temperature        float64                `json:"temperature,omitempty"`
+	TopP               float64                `json:"top_p,omitempty"`
+	Stream             bool                   `json:"stream,omitempty"`
+	Tools              []OpenAITool           `json:"tools,omitempty"`
+	ToolChoice         interface{}            `json:"tool_choice,omitempty"`
+	ResponseFormat     map[string]interface{} `json:"response_format,omitempty"`
+	ReasoningEffort    string                 `json:"reasoning_effort,omitempty"`
+	ForceSystemInject  bool                   `json:"-"` // Responses API: new instructions on continuation
 }
 
 const kiroMaxOutputTokens = 32000
@@ -1109,41 +1158,28 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
-func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+func OpenAIToKiro(req *OpenAIRequest, thinking bool, agentic bool, chatOnly bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	var systemPrompt string
+	var baseSystem string
 	var nonSystemMessages []OpenAIMessage
 
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
 			if s := extractOpenAIMessageText(msg.Content); s != "" {
-				systemPrompt += s + "\n"
+				baseSystem += s + "\n"
 			}
 		} else {
 			nonSystemMessages = append(nonSystemMessages, msg)
 		}
 	}
-
-	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+	baseSystem = strings.TrimSpace(baseSystem)
+	if baseSystem != "" {
+		baseSystem = applyPromptFilters(baseSystem)
 	}
-
-	if hint := extractOpenAIToolChoiceHint(req.ToolChoice); hint != "" {
-		if systemPrompt != "" {
-			systemPrompt += "\n"
-		}
-		systemPrompt += hint
-	}
-	if hint := extractOpenAIResponseFormatHint(req.ResponseFormat); hint != "" {
-		if systemPrompt != "" {
-			systemPrompt += "\n"
-		}
-		systemPrompt += hint
-	}
+	fullSystem := assembleKiroSystemPrompt(baseSystem, thinking, agentic, req.ToolChoice, req.ResponseFormat)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -1236,24 +1272,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// Keep system instructions in history instead of user content.
-	if systemPrompt != "" {
-		priming := []KiroHistoryMessage{
-			{
-				UserInputMessage: &KiroUserInputMessage{
-					Content: strings.TrimSpace(systemPrompt),
-					ModelID: modelID,
-					Origin:  origin,
-				},
-			},
-			{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content: "I will follow these instructions.",
-				},
-			},
-		}
-		history = append(priming, history...)
-	}
+	history = trimLeadingAssistantHistory(history)
 
 	// Decide whether current tool results form a valid active tool turn; if not,
 	// flatten them into the current message text (see ClaudeToKiro for rationale).
@@ -1266,21 +1285,24 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = sanitizeKiroHistory(history, nil)
 	}
 
-	// 构建最终内容
-	finalContent := buildFinalUserContent(currentContent, currentImages, currentToolResults, keepCurrentToolResults)
+	// 构建最终内容 — system prompt embedded in current user turn (cliproxy++ pattern).
+	userBody := buildFinalUserContent(currentContent, currentImages, currentToolResults, keepCurrentToolResults)
+	effectiveSystem := effectiveSystemPromptForTurn(fullSystem, len(history), req.ForceSystemInject)
+	finalContent := embedKiroSystemPrompt(userBody, effectiveSystem)
 
 	// 转换工具
 	var kiroTools []KiroToolWrapper
 	var toolNameMap map[string]string
-	if openAIToolsAllowed(req) {
+	if !chatOnly && openAIToolsAllowed(req) {
 		kiroTools, toolNameMap = convertOpenAITools(req.Tools)
+		kiroTools = compressToolsIfNeeded(kiroTools)
 	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, fullSystem, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -1312,9 +1334,21 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	truncatePayloadToLimit(payload)
 
 	return payload
+}
+
+func appendSystemHint(systemPrompt, hint string) string {
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		return systemPrompt
+	}
+	systemPrompt = strings.TrimSpace(systemPrompt)
+	if systemPrompt == "" {
+		return hint
+	}
+	return systemPrompt + "\n" + hint
 }
 
 func normalizeOpenAIMaxTokens(maxTokens int) int {
@@ -1325,28 +1359,57 @@ func normalizeOpenAIMaxTokens(maxTokens int) int {
 }
 
 func openAIToolsAllowed(req *OpenAIRequest) bool {
-	if req == nil || len(req.Tools) == 0 {
+	return toolsAllowedByChoice(req.ToolChoice, req != nil && len(req.Tools) > 0)
+}
+
+func claudeToolsAllowed(req *ClaudeRequest) bool {
+	return toolsAllowedByChoice(req.ToolChoice, req != nil && len(req.Tools) > 0)
+}
+
+func toolsAllowedByChoice(toolChoice interface{}, hasTools bool) bool {
+	if !hasTools {
 		return false
 	}
-	switch v := req.ToolChoice.(type) {
+	switch v := toolChoice.(type) {
 	case string:
 		return strings.ToLower(strings.TrimSpace(v)) != "none"
+	case map[string]interface{}:
+		typ, _ := v["type"].(string)
+		return strings.ToLower(strings.TrimSpace(typ)) != "none"
 	default:
 		return true
 	}
 }
 
-func extractOpenAIToolChoiceHint(toolChoice interface{}) string {
+const (
+	toolChoiceNoneHint     = "[INSTRUCTION: Do NOT use any tools. Respond with text only.]"
+	toolChoiceRequiredHint = "[INSTRUCTION: You MUST use at least one of the available tools to respond. Do not respond with text only - always make a tool call.]"
+)
+
+func extractToolChoiceHint(toolChoice interface{}) string {
+	if toolChoice == nil {
+		return ""
+	}
 	switch v := toolChoice.(type) {
 	case string:
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "none":
-			return "[INSTRUCTION: Do NOT use any tools. Respond with text only.]"
-		case "required":
-			return "[INSTRUCTION: You MUST use at least one of the available tools to respond. Do not respond with text only - always make a tool call.]"
+			return toolChoiceNoneHint
+		case "required", "any":
+			return toolChoiceRequiredHint
 		}
 	case map[string]interface{}:
-		if typ, _ := v["type"].(string); typ == "function" {
+		typ, _ := v["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(typ)) {
+		case "none":
+			return toolChoiceNoneHint
+		case "required", "any":
+			return toolChoiceRequiredHint
+		case "tool":
+			if name, _ := v["name"].(string); name != "" {
+				return fmt.Sprintf("[INSTRUCTION: You MUST use the tool named '%s' to respond. Do not use any other tool or respond with text only.]", name)
+			}
+		case "function":
 			if fn, ok := v["function"].(map[string]interface{}); ok {
 				if name, _ := fn["name"].(string); name != "" {
 					return fmt.Sprintf("[INSTRUCTION: You MUST use the tool named '%s' to respond. Do not use any other tool or respond with text only.]", name)
@@ -1355,6 +1418,10 @@ func extractOpenAIToolChoiceHint(toolChoice interface{}) string {
 		}
 	}
 	return ""
+}
+
+func extractOpenAIToolChoiceHint(toolChoice interface{}) string {
+	return extractToolChoiceHint(toolChoice)
 }
 
 func extractOpenAIResponseFormatHint(responseFormat map[string]interface{}) string {
@@ -1516,24 +1583,19 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 	return true
 }
 
-// pollutedToolCallTextPattern matches the legacy "[Called tool X with input ...]"
-// / "[Called tool X]" narration that an earlier version of this proxy wrote into
-// assistant turns. Models trained on that in-context text began emitting it as
-// output instead of issuing real tool calls; clients then stored that output as
-// assistant history and replay it, re-seeding the pollution. We strip it from
-// assistant content on the way back upstream so the pattern is not reinforced
-// and the model can recover within an ongoing session.
-var pollutedToolCallTextPattern = regexp.MustCompile(`\[Called tool [^\]]*\]`)
-
 // stripPollutedToolCallText removes legacy tool-call narration from text and
-// tidies up the leftover whitespace.
+// tidies up the leftover whitespace. Covers [Called ...], <tool_call>, and
+// hallucinated <tool_response> blocks replayed from polluted client history.
 func stripPollutedToolCallText(content string) string {
-	if !strings.Contains(content, "[Called tool ") {
+	if content == "" {
 		return content
 	}
-	cleaned := pollutedToolCallTextPattern.ReplaceAllString(content, "")
-	// Collapse blank lines left behind by removed markers.
-	cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
+	if !strings.Contains(content, "[Called") &&
+		!strings.Contains(strings.ToLower(content), "<tool_call") &&
+		!strings.Contains(strings.ToLower(content), "<tool_response") {
+		return content
+	}
+	cleaned := stripCompleteToolNarrationBlocks(content)
 	return strings.TrimSpace(cleaned)
 }
 
@@ -1725,15 +1787,13 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
 // serialized payload fits within maxPayloadBytes. It preserves, in order:
-//   - the system priming pair (if present) at the front of history,
 //   - the most recent turns (at least minRecentHistoryTurns, and always the
 //     active tool turn that pairs with the current message),
 //   - the current message itself.
 //
 // A single placeholder note (truncationPlaceholder) is inserted where older
-// turns were removed so the model is aware context was elided. hasPriming
-// indicates whether history begins with the 2-entry system priming pair.
-func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
+// turns were removed so the model is aware context was elided.
+func truncatePayloadToLimit(payload *KiroPayload) {
 	if payload == nil {
 		return
 	}
@@ -1742,16 +1802,10 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	}
 
 	history := payload.ConversationState.History
-	primingCount := 0
-	if hasPriming && len(history) >= 2 {
-		primingCount = 2
-	}
-
-	priming := history[:primingCount]
-	conversation := history[primingCount:]
+	conversation := history
 
 	// Compute the fixed overhead (everything except the trimmable conversation):
-	// priming, current message, inference config, profileArn, etc. We estimate by
+	// current message, inference config, profileArn, etc. We estimate by
 	// measuring the payload with an empty conversation tail, then add a budget for
 	// the placeholder and retained tail turns.
 	placeholderEntry := KiroHistoryMessage{
@@ -1768,8 +1822,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 		entrySizes[i] = historyEntryByteSize(conversation[i])
 	}
 
-	// Base size: payload with priming only (no conversation), plus placeholder.
-	payload.ConversationState.History = priming
+	// Base size: payload with no conversation, plus placeholder.
+	payload.ConversationState.History = nil
 	baseSize := payloadByteSize(payload) + historyEntryByteSize(placeholderEntry)
 
 	// Keep the largest suffix of the conversation that fits, but never fewer than
@@ -1788,8 +1842,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	tail := conversation[keepFrom:]
 	tail = dropLeadingAssistant(tail)
 
-	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
-	rebuilt = append(rebuilt, priming...)
+	rebuilt := make([]KiroHistoryMessage, 0, 1+len(tail))
 	if keepFrom > 0 { // older turns were dropped → note the elision
 		rebuilt = append(rebuilt, placeholderEntry)
 	}
@@ -2171,13 +2224,13 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 		msg.Content = nil
 		msg.ToolCalls = make([]ToolCall, len(toolUses))
 		for i, tu := range toolUses {
-			args, _ := json.Marshal(tu.Input)
+			args := MarshalToolUseArguments(tu)
 			msg.ToolCalls[i] = ToolCall{
 				ID:   tu.ToolUseID,
 				Type: "function",
 			}
 			msg.ToolCalls[i].Function.Name = tu.Name
-			msg.ToolCalls[i].Function.Arguments = string(args)
+			msg.ToolCalls[i].Function.Arguments = args
 		}
 		finishReason = "tool_calls"
 	} else {
@@ -2241,13 +2294,13 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 		message["content"] = nil
 		toolCalls := make([]map[string]interface{}, len(toolUses))
 		for i, tu := range toolUses {
-			args, _ := json.Marshal(tu.Input)
+			args := MarshalToolUseArguments(tu)
 			toolCalls[i] = map[string]interface{}{
 				"id":   tu.ToolUseID,
 				"type": "function",
 				"function": map[string]string{
 					"name":      tu.Name,
-					"arguments": string(args),
+					"arguments": args,
 				},
 			}
 		}
